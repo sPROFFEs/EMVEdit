@@ -1414,10 +1414,4 @@ https://github.com/your-repo/emv-professional-tool
 
 # Actualización de las clases de apoyo para mayor compatibilidad
 
-# Función principal para ejecutar la aplicación
-def main():
-    app = EMVProfessionalTool()
-    app.run()
-
-if __name__ == "__main__":
-    main()
+# Actualización de las clases de apoyo para mayor compatibilidad
