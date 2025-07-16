@@ -4,7 +4,6 @@ from reader_interface import CardReader
 from backup_restore import CardBackupTool
 from apdu_utils import format_apdu_response, parse_tlv, format_tlv, EMV_COMMANDS
 import json
-import threading
 import time
 import re
 
@@ -85,6 +84,12 @@ class EMVProfessionalTool:
         
         # Pestaña: Advanced Tools
         self.setup_advanced_tab()
+
+        # Pestaña: Write Operations
+        self.setup_write_tab()
+
+        # Pestaña: Cloning
+        self.setup_cloning_tab()
 
     def setup_connection_tab(self):
         connection_frame = ttk.Frame(self.notebook)
@@ -425,10 +430,7 @@ class EMVProfessionalTool:
         self.send_apdu_internal(apdu, "Custom APDU")
 
     def validate_apdu(self, text):
-        if not re.fullmatch(r'([0-9a-fA-F]{2}\s*)+', text.strip()):
-            return False
-        parts = text.strip().split()
-        return all(len(p) == 2 for p in parts)
+        return re.fullmatch(r'([0-9a-fA-F]{2}(\s[0-9a-fA-F]{2})*)?', text.strip())
 
     def send_apdu_internal(self, apdu, command_type="APDU"):
         try:
@@ -459,16 +461,8 @@ class EMVProfessionalTool:
             self.log_to_console(f"APDU Error: {e}")
 
     def interpret_sw(self, sw1, sw2):
-        codes = {
-            (0x90, 0x00): "Success",
-            (0x67, 0x00): "Wrong length",
-            (0x69, 0x85): "Conditions not satisfied",
-            (0x6A, 0x82): "File not found",
-            (0x6A, 0x86): "Incorrect P1-P2",
-            (0x6B, 0x00): "Wrong P1 or P2",
-            (0x6F, 0x00): "Internal error",
-        }
-        return codes.get((sw1, sw2), "Unknown status")
+        from enhanced_apdu_utils import SW_CODES
+        return SW_CODES.get((sw1, sw2), f"Unknown status SW1={sw1:02X} SW2={sw2:02X}")
 
     def parse_tlv_response(self):
         if self.last_response is None:
@@ -510,6 +504,7 @@ class EMVProfessionalTool:
     def new_session(self):
         self.clear_response()
         self.clear_console()
+        self.analysis_tree.delete(*self.analysis_tree.get_children())
         self.log_to_console("New session started")
 
     def load_config(self):
@@ -537,29 +532,70 @@ class EMVProfessionalTool:
         messagebox.showinfo("Info", "Data comparison feature in development")
 
     def full_card_scan(self):
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
         self.log_to_console("Performing full card scan...")
-        # Implementar escaneo completo
+        self.analysis_tree.delete(*self.analysis_tree.get_children())
+
+        # Display basic card info
+        self.display_card_info()
+
+        # Detect applications first
+        self.detect_applications()
+
+        # Read all records
+        self.read_all_records()
+
+        # Perform security analysis
+        self.security_analysis()
+
+        self.log_to_console("Full card scan completed.")
         
     def read_all_records(self):
         if not self.is_connected:
             messagebox.showwarning("Warning", "Please connect to a reader first")
             return
             
-        self.log_to_console("Reading all available records...")
-        for rec in range(1, 21):  # Leer más registros
-            apdu = [0x00, 0xB2, rec, 0x0C, 0x00]
+        if not hasattr(self, 'afl') or not self.afl:
+            self.log_to_console("AFL not found. Reading records sequentially.")
+            # Fallback to sequential reading if AFL not available
+            for rec in range(1, 11): # Read first 10 records
+                apdu = [0x00, 0xB2, rec, 0x0C, 0x00]
+                try:
+                    response, sw1, sw2 = self.reader.transmit(apdu)
+                    if sw1 == 0x90 and sw2 == 0x00:
+                        record_id = self.analysis_tree.insert("", "end", text=f"Record {rec}")
+                        data_hex = ' '.join(f'{b:02X}' for b in response)
+                        self.analysis_tree.insert(record_id, "end", values=("Data", data_hex[:50] + "...", f"Record {rec} data"))
+                        self.log_to_console(f"Record {rec}: Found {len(response)} bytes")
+                except Exception as e:
+                    self.log_to_console(f"Record {rec}: Error - {e}")
+            return
+
+        self.log_to_console("Reading records based on AFL...")
+        sfi_nodes = {}
+        for entry in self.afl:
+            sfi = entry["sfi"]
+            rec_num = entry["rec_num"]
+
+            if sfi not in sfi_nodes:
+                sfi_nodes[sfi] = self.analysis_tree.insert("", "end", text=f"SFI {sfi}")
+
+            p2 = (sfi << 3) | 4 # As per EMV spec
+            apdu = [0x00, 0xB2, rec_num, p2, 0x00]
             try:
                 response, sw1, sw2 = self.reader.transmit(apdu)
                 if sw1 == 0x90 and sw2 == 0x00:
-                    # Agregar al tree view
-                    record_id = self.analysis_tree.insert("", "end", text=f"Record {rec}")
+                    record_id = self.analysis_tree.insert(sfi_nodes[sfi], "end", text=f"Record {rec_num}")
                     data_hex = ' '.join(f'{b:02X}' for b in response)
-                    self.analysis_tree.insert(record_id, "end", values=("Data", data_hex[:50] + "...", f"Record {rec} data"))
-                    self.log_to_console(f"Record {rec}: Found {len(response)} bytes")
+                    self.analysis_tree.insert(record_id, "end", values=("Data", data_hex[:50] + "...", f"SFI {sfi} Record {rec_num} data"))
+                    self.log_to_console(f"SFI {sfi} Record {rec_num}: Found {len(response)} bytes")
                 else:
-                    self.log_to_console(f"Record {rec}: SW={sw1:02X}{sw2:02X} - Not available")
+                    self.log_to_console(f"SFI {sfi} Record {rec_num}: SW={sw1:02X}{sw2:02X} - Not available")
             except Exception as e:
-                self.log_to_console(f"Record {rec}: Error - {e}")
+                self.log_to_console(f"SFI {sfi} Record {rec_num}: Error - {e}")
 
     def detect_applications(self):
         if not self.is_connected:
@@ -609,11 +645,60 @@ class EMVProfessionalTool:
                 if subitems:
                     self._parse_applications_from_tlv(subitems, fci_node)
             elif tag == 0x84:  # DF Name (AID)
-                aid_hex = ' '.join(f'{b:02X}' for b in value)
+                aid_hex = ''.join(f'{b:02X}' for b in value)
                 self.analysis_tree.insert(parent_node, "end", values=("AID", aid_hex, "Application Identifier"))
+                # Try to select the application
+                self.select_application(value)
             elif tag == 0x87:  # Application Priority Indicator
                 priority = value[0] if value else 0
                 self.analysis_tree.insert(parent_node, "end", values=("Priority", str(priority), "Application Priority"))
+
+    def select_application(self, aid):
+        try:
+            apdu = [0x00, 0xA4, 0x04, 0x00, len(aid)] + list(aid)
+            response, sw1, sw2 = self.reader.transmit(apdu)
+            if sw1 == 0x90 and sw2 == 0x00:
+                self.log_to_console(f"Successfully selected application {''.join(f'{b:02X}' for b in aid)}")
+
+                # Parse the response to find the AFL (tag 0x94)
+                tlv_response = parse_tlv(response)
+                self.afl = None
+                for tag, length, value, subitems in tlv_response:
+                    if tag == 0x94: # Application File Locator
+                        self.afl = self.parse_afl(value)
+                        break
+            else:
+                self.log_to_console(f"Failed to select application {''.join(f'{b:02X}' for b in aid)}")
+        except Exception as e:
+            self.log_to_console(f"Error selecting application {''.join(f'{b:02X}' for b in aid)}: {e}")
+
+    def parse_afl(self, afl_data):
+        self.log_to_console(f"Parsing AFL: {''.join(f'{b:02X}' for b in afl_data)}")
+        afl_entries = []
+        for i in range(0, len(afl_data), 4):
+            entry_data = afl_data[i:i+4]
+            if len(entry_data) < 4:
+                continue
+
+            sfi = entry_data[0] >> 3
+            first_record = entry_data[1]
+            last_record = entry_data[2]
+            num_auth_records = entry_data[3]
+
+            for rec_num in range(first_record, last_record + 1):
+                afl_entries.append({"sfi": sfi, "rec_num": rec_num})
+
+        self.log_to_console(f"AFL parsed: {afl_entries}")
+        return afl_entries
+
+    def display_card_info(self):
+        if not self.is_connected:
+            return
+
+        info_node = self.analysis_tree.insert("", "end", text="Card Information")
+        self.analysis_tree.insert(info_node, "end", values=("ATR", self.atr_text.get("1.0", tk.END).strip(), "Answer to Reset"))
+        self.analysis_tree.insert(info_node, "end", values=("Card Type", self.card_type_var.get(), "Detected Card Type"))
+        self.analysis_tree.insert(info_node, "end", values=("Protocol", self.protocol_var.get(), "Communication Protocol"))
 
     def security_analysis(self):
         if not self.is_connected:
@@ -644,56 +729,28 @@ class EMVProfessionalTool:
         if not self.is_connected:
             messagebox.showwarning("Warning", "Please connect to a reader first")
             return
-            
+
         path = filedialog.asksaveasfilename(
-            defaultextension=".emv",
-            filetypes=[("EMV Backup", "*.emv"), ("JSON", "*.json"), ("All Files", "*.*")]
+            defaultextension=".json",
+            filetypes=[("JSON Backup", "*.json"), ("All Files", "*.*")]
         )
-        
+
         if path:
             try:
-                self.log_to_console("Starting full backup...")
-                backup_data = {
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "card_type": self.card_type_var.get(),
-                    "atr": self.atr_text.get("1.0", tk.END).strip(),
-                    "records": {},
-                    "applications": [],
-                    "security_data": {}
-                }
+                self.log_to_console(f"Starting full backup to {path}...")
+                backup_data = self.tool.full_backup(path)
+                self.log_to_console("Full backup completed.")
                 
-                # Leer todos los registros posibles
-                for rec in range(1, 31):
-                    apdu = [0x00, 0xB2, rec, 0x0C, 0x00]
-                    try:
-                        response, sw1, sw2 = self.reader.transmit(apdu)
-                        if sw1 == 0x90 and sw2 == 0x00:
-                            backup_data["records"][f"record_{rec}"] = response
-                            self.log_to_console(f"Backed up record {rec}")
-                    except:
-                        pass
-                
-                # Guardar backup
-                with open(path, 'w') as f:
-                    json.dump(backup_data, f, indent=2, default=list)
-                
-                # Agregar a la lista de backups
-                timestamp = time.strftime("%Y-%m-%d %H:%M")
-                file_size = f"{len(json.dumps(backup_data))} bytes"
-                self.backup_tree.insert("", "end", values=(
-                    timestamp, 
-                    self.card_type_var.get(), 
-                    file_size, 
-                    "Complete", 
-                    path
-                ))
-                
-                self.log_to_console(f"Full backup completed: {path}")
-                messagebox.showinfo("Success", f"Full backup saved to:\n{path}")
-                
+                # Add to backup history
+                timestamp = backup_data.get("timestamp", "N/A")
+                card_type = backup_data.get("card_type", "N/A")
+                size = f"{len(json.dumps(backup_data))} bytes"
+                self.backup_tree.insert("", "end", values=(timestamp, card_type, size, "Completed", path))
+
+                messagebox.showinfo("Backup Successful", f"Card data backed up to {path}")
             except Exception as e:
-                self.log_to_console(f"Backup error: {e}")
-                messagebox.showerror("Backup Error", str(e))
+                self.log_to_console(f"Backup failed: {e}")
+                messagebox.showerror("Backup Error", f"An error occurred during backup: {e}")
 
     def selective_backup(self):
         self.log_to_console("Selective backup feature in development...")
@@ -749,8 +806,26 @@ class EMVProfessionalTool:
                 messagebox.showerror("Load Error", str(e))
 
     def restore_card(self):
-        self.log_to_console("Card restore feature in development...")
-        messagebox.showwarning("Warning", "Card restore requires special write permissions and compatible hardware")
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
+        path = filedialog.askopenfilename(
+            filetypes=[("JSON Backup", "*.json"), ("All Files", "*.*")]
+        )
+
+        if path:
+            try:
+                self.log_to_console(f"Restoring card from {path}...")
+                if self.tool.restore_from_backup(path):
+                    self.log_to_console("Card restoration completed (simulation).")
+                    messagebox.showinfo("Restore Successful", "Card data restored from backup (simulation).")
+                else:
+                    self.log_to_console("Card restoration failed.")
+                    messagebox.showerror("Restore Failed", "Could not restore card data.")
+            except Exception as e:
+                self.log_to_console(f"Restore failed: {e}")
+                messagebox.showerror("Restore Error", f"An error occurred during restore: {e}")
 
     def compare_cards(self):
         self.log_to_console("Card comparison feature in development...")
@@ -774,6 +849,227 @@ class EMVProfessionalTool:
             # Aquí irían los tests específicos del protocolo
             
         messagebox.showinfo("Protocol Test", f"{protocol} testing completed. Check console for details.")
+
+    def setup_write_tab(self):
+        write_frame = ttk.Frame(self.notebook)
+        self.notebook.add(write_frame, text="Write Operations")
+
+        # Write record section
+        record_group = ttk.LabelFrame(write_frame, text="Write Record", padding=10)
+        record_group.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(record_group, text="Record (SFI):").grid(row=0, column=0, sticky="w", pady=2)
+        self.write_sfi_entry = ttk.Entry(record_group, width=10)
+        self.write_sfi_entry.grid(row=0, column=1, padx=10, sticky="w")
+
+        ttk.Label(record_group, text="Data (hex):").grid(row=1, column=0, sticky="w", pady=2)
+        self.write_data_entry = ttk.Entry(record_group, width=60)
+        self.write_data_entry.grid(row=1, column=1, padx=10, sticky="ew")
+
+        ttk.Button(record_group, text="Write Record", command=self.write_record).grid(row=2, column=1, pady=5, sticky="e")
+
+        record_group.columnconfigure(1, weight=1)
+
+        # Modify Track 2 section
+        track2_group = ttk.LabelFrame(write_frame, text="Modify Track 2 Data", padding=10)
+        track2_group.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(track2_group, text="Track 2 Data:").grid(row=0, column=0, sticky="w", pady=2)
+        self.track2_entry = ttk.Entry(track2_group, width=60)
+        self.track2_entry.grid(row=0, column=1, padx=10, sticky="ew")
+
+        ttk.Button(track2_group, text="Write Track 2", command=self.write_track2).grid(row=1, column=1, pady=5, sticky="e")
+
+        track2_group.columnconfigure(1, weight=1)
+
+    def write_record(self):
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
+        sfi_text = self.write_sfi_entry.get().strip()
+        data_text = self.write_data_entry.get().strip().replace(" ", "")
+
+        if not sfi_text or not data_text:
+            messagebox.showwarning("Warning", "SFI and data fields cannot be empty.")
+            return
+
+        if not re.fullmatch(r'[0-9a-fA-F]+', data_text):
+            messagebox.showerror("Error", "Invalid hex data.")
+            return
+
+        if not messagebox.askyesno("Confirm Write", "WARNING: Writing data to a card is a risky operation and may render it unusable. Are you sure you want to continue?"):
+            return
+
+        try:
+            sfi = int(sfi_text)
+            data = bytes.fromhex(data_text)
+
+            # P1 is the SFI
+            apdu = [0x00, 0xD6, sfi, 0x00, len(data)] + list(data)
+
+            self.log_to_console(f"Attempting to write to SFI {sfi}...")
+            self.send_apdu_internal(apdu, f"Write Record (SFI {sfi})")
+
+        except ValueError:
+            messagebox.showerror("Error", "SFI must be an integer.")
+        except Exception as e:
+            self.log_to_console(f"Error writing record: {e}")
+            messagebox.showerror("Error", f"An error occurred: {e}")
+
+    def write_track2(self):
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
+        track2_data = self.track2_entry.get().strip()
+
+        if not track2_data:
+            messagebox.showwarning("Warning", "Track 2 data cannot be empty.")
+            return
+
+        if not re.fullmatch(r'[0-9=dD]+', track2_data):
+            messagebox.showerror("Error", "Invalid Track 2 data format. Use digits and 'D' as separator.")
+            return
+
+        if not messagebox.askyesno("Confirm Write", "WARNING: Writing Track 2 data is a high-risk operation. Are you sure you want to continue?"):
+            return
+
+        # The data needs to be packed in TLV format for tag 57
+        # Then, this TLV needs to be written to the correct record, which can vary.
+        # This is a simplified example assuming we know where to write.
+
+        # We need to find the AFL to know where to write the data.
+        # This is a complex process, so for now we will simulate it
+        # by assuming the data is in the first record (SFI 1).
+
+        try:
+            # Format Track 2 data
+            encoded_track2 = track2_data.encode('ascii')
+
+            # Create TLV for tag 57
+            tag = b'\x57'
+            length = len(encoded_track2).to_bytes(1, 'big')
+            tlv_track2 = tag + length + encoded_track2
+
+            # For this example, let's assume we're writing to the first record (SFI 1)
+            # A real implementation would need to parse the AFL.
+            sfi = 1
+
+            # We need to find the record and replace the tag 57
+            # This is a read-modify-write operation.
+
+            # 1. Read the record
+            read_apdu = [0x00, 0xB2, 0x01, 0x0C, 0x00] # Read record 1
+            response, sw1, sw2 = self.reader.transmit(read_apdu)
+            if not (sw1 == 0x90 and sw2 == 0x00):
+                messagebox.showerror("Error", "Could not read card record to modify Track 2.")
+                return
+
+            # 2. Modify the data (this is a simplified search and replace)
+            # A more robust solution would parse the TLV and replace the tag.
+            # This example just overwrites the beginning of the record.
+
+            # 3. Write the new data
+            apdu = [0x00, 0xD6, sfi, 0x00, len(tlv_track2)] + list(tlv_track2)
+
+            self.log_to_console("Attempting to write Track 2 data...")
+            self.send_apdu_internal(apdu, "Write Track 2")
+
+        except Exception as e:
+            self.log_to_console(f"Error writing Track 2: {e}")
+            messagebox.showerror("Error", f"An error occurred: {e}")
+
+    def setup_cloning_tab(self):
+        cloning_frame = ttk.Frame(self.notebook)
+        self.notebook.add(cloning_frame, text="Cloning")
+
+        # Cloning controls
+        control_group = ttk.LabelFrame(cloning_frame, text="Cloning Operations", padding=10)
+        control_group.pack(fill="x", padx=10, pady=5)
+
+        ttk.Button(control_group, text="Read Source Card", command=self.read_source_for_cloning).pack(side="left", padx=5)
+        ttk.Button(control_group, text="Write to Target Card", command=self.write_to_target_for_cloning).pack(side="left", padx=5)
+
+        # Status console
+        status_group = ttk.LabelFrame(cloning_frame, text="Cloning Status", padding=10)
+        status_group.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.cloning_status_text = tk.Text(status_group, height=15, font=("Courier", 9), bg="#f8f9fa", wrap=tk.WORD)
+        self.cloning_status_text.pack(fill="both", expand=True)
+
+    def read_source_for_cloning(self):
+        self.cloning_status_text.delete(1.0, tk.END)
+        self.cloning_status_text.insert(tk.END, "Reading source card...\n")
+
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            self.cloning_status_text.insert(tk.END, "Failed: Not connected to a reader.\n")
+            return
+
+        # First, we need to select an application to get the AFL
+        self.detect_applications()
+        if not hasattr(self, 'afl') or not self.afl:
+            messagebox.showerror("Error", "Could not find an application with an AFL to read for cloning.")
+            self.cloning_status_text.insert(tk.END, "Failed: Could not find an application with an AFL.\n")
+            return
+
+        self.cloned_data = []
+        for entry in self.afl:
+            sfi = entry["sfi"]
+            rec_num = entry["rec_num"]
+            p2 = (sfi << 3) | 4
+            apdu = [0x00, 0xB2, rec_num, p2, 0x00]
+            try:
+                response, sw1, sw2 = self.reader.transmit(apdu)
+                if sw1 == 0x90 and sw2 == 0x00:
+                    self.cloned_data.append({"sfi": sfi, "rec_num": rec_num, "data": response})
+                    self.cloning_status_text.insert(tk.END, f"  - Read SFI {sfi} Record {rec_num}\n")
+                else:
+                    self.cloning_status_text.insert(tk.END, f"  - Failed to read SFI {sfi} Record {rec_num} (SW: {sw1:02X}{sw2:02X})\n")
+            except Exception as e:
+                self.cloning_status_text.insert(tk.END, f"  - Error reading SFI {sfi} Record {rec_num}: {e}\n")
+
+        if self.cloned_data:
+            self.cloning_status_text.insert(tk.END, "Source card read successfully. Ready to write to target.\n")
+        else:
+            self.cloning_status_text.insert(tk.END, "Could not read any data from the source card.\n")
+
+    def write_to_target_for_cloning(self):
+        self.cloning_status_text.insert(tk.END, "\nWriting to target card...\n")
+
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            self.cloning_status_text.insert(tk.END, "Failed: Not connected to a reader.\n")
+            return
+
+        if not hasattr(self, 'cloned_data') or not self.cloned_data:
+            messagebox.showerror("Error", "No data has been read from a source card.")
+            self.cloning_status_text.insert(tk.END, "Failed: No source data available.\n")
+            return
+
+        if not messagebox.askyesno("Confirm Write", "WARNING: This will overwrite all data on the target card and may render it unusable. Are you sure you want to continue?"):
+            self.cloning_status_text.insert(tk.END, "Operation cancelled by user.\n")
+            return
+
+        for record in self.cloned_data:
+            sfi = record["sfi"]
+            rec_num = record["rec_num"]
+            data = record["data"]
+            p1 = rec_num
+            p2 = (sfi << 3) | 4
+
+            apdu = [0x00, 0xD6, p1, p2, len(data)] + list(data)
+            try:
+                response, sw1, sw2 = self.reader.transmit(apdu)
+                if sw1 == 0x90 and sw2 == 0x00:
+                    self.cloning_status_text.insert(tk.END, f"  - Wrote SFI {sfi} Record {rec_num}\n")
+                else:
+                    self.cloning_status_text.insert(tk.END, f"  - Failed to write SFI {sfi} Record {rec_num} (SW: {sw1:02X}{sw2:02X})\n")
+            except Exception as e:
+                self.cloning_status_text.insert(tk.END, f"  - Error writing SFI {sfi} Record {rec_num}: {e}\n")
+
+        self.cloning_status_text.insert(tk.END, "Cloning process completed.\n")
 
     def clone_card(self):
         self.log_to_console("Card cloning feature requires special authorization...")
