@@ -163,7 +163,6 @@ SW_CODES = {
     (0x62, 0x88): "Reserved",
     (0x62, 0xA2): "Wrong R-MAC",
     (0x62, 0xA4): "Card locked (during reset( ))",
-    (0x62, 0xCX): "Counter with value X (command dependent)",
     (0x62, 0xF1): "Wrong C-MAC",
     (0x62, 0xF3): "Internal reset",
     (0x62, 0xF5): "Default agent locked",
@@ -186,7 +185,6 @@ SW_CODES = {
     (0x63, 0xC1): "Verify fail, 1 try left",
     (0x63, 0xC2): "Verify fail, 2 tries left",
     (0x63, 0xC3): "Verify fail, 3 tries left",
-    (0x63, 0xCX): "Verify fail, X retries left",
     
     # Checking errors
     (0x64, 0x00): "No information given (NV-Ram not changed)",
@@ -280,9 +278,12 @@ def interpret_sw_professional(sw1, sw2):
             return f"{base_meaning} (SW2 = {sw2:02X})"
     
     # Check special patterns
+    if sw1 == 0x62 and (sw2 & 0xF0) == 0xC0:
+        counter = sw2 & 0x0F
+        return f"Counter with value {counter} (command dependent)"
     if sw1 == 0x63 and (sw2 & 0xF0) == 0xC0:
         retries = sw2 & 0x0F
         return f"Verify fail, {retries} retries left"
     
     # Unknown status
-    return f"Unknown status (SW1={sw1:02X} SW
+    return f"Unknown status (SW1={sw1:02X} SW2={sw2:02X})"
