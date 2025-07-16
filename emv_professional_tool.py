@@ -91,6 +91,15 @@ class EMVProfessionalTool:
         # Pestaña: Cloning
         self.setup_cloning_tab()
 
+        # Pestaña: Java Card
+        self.setup_jcard_tab()
+
+        # Pestaña: SIM Card
+        self.setup_sim_tab()
+
+        # Pestaña: Crypto Wallet
+        self.setup_crypto_tab()
+
     def setup_connection_tab(self):
         connection_frame = ttk.Frame(self.notebook)
         self.notebook.add(connection_frame, text="Connection & Reader")
@@ -1070,6 +1079,271 @@ class EMVProfessionalTool:
                 self.cloning_status_text.insert(tk.END, f"  - Error writing SFI {sfi} Record {rec_num}: {e}\n")
 
         self.cloning_status_text.insert(tk.END, "Cloning process completed.\n")
+
+    def setup_jcard_tab(self):
+        jcard_frame = ttk.Frame(self.notebook)
+        self.notebook.add(jcard_frame, text="Java Card")
+
+        # JCard controls
+        control_group = ttk.LabelFrame(jcard_frame, text="JCOP Operations", padding=10)
+        control_group.pack(fill="x", padx=10, pady=5)
+
+        ttk.Button(control_group, text="List Applets", command=self.list_applets).pack(side="left", padx=5)
+
+        # Applet list
+        applet_group = ttk.LabelFrame(jcard_frame, text="Installed Applets", padding=10)
+        applet_group.pack(fill="both", expand=True, padx=10, pady=5)
+
+        columns = ("AID", "State")
+        self.applet_tree = ttk.Treeview(applet_group, columns=columns, show="headings", height=15)
+        self.applet_tree.heading("AID", text="Applet AID")
+        self.applet_tree.heading("State", text="State")
+        self.applet_tree.column("AID", width=400)
+        self.applet_tree.column("State", width=150)
+        self.applet_tree.pack(fill="both", expand=True)
+
+    def list_applets(self):
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
+        self.applet_tree.delete(*self.applet_tree.get_children())
+
+        # Standard AID for JCOP Card Manager
+        card_manager_aid = bytes.fromhex("A000000003000000")
+
+        try:
+            # Select the Card Manager
+            apdu = [0x00, 0xA4, 0x04, 0x00, len(card_manager_aid)] + list(card_manager_aid)
+            response, sw1, sw2 = self.reader.transmit(apdu)
+
+            if sw1 != 0x90 or sw2 != 0x00:
+                messagebox.showerror("Error", "Could not select Card Manager. Is this a JCOP card?")
+                return
+
+            self.log_to_console("Card Manager selected successfully.")
+
+            # Send GET STATUS command to list applets
+            get_status_apdu = [0x80, 0xF2, 0x40, 0x00, 0x02, 0x4F, 0x00]
+            response, sw1, sw2 = self.reader.transmit(get_status_apdu)
+
+            if sw1 != 0x90 or sw2 != 0x00:
+                messagebox.showerror("Error", f"Could not get applet list (SW: {sw1:02X}{sw2:02X})")
+                return
+
+            self.parse_get_status_response(response)
+
+        except Exception as e:
+            self.log_to_console(f"Error selecting Card Manager: {e}")
+            messagebox.showerror("Error", f"An error occurred: {e}")
+
+    def parse_get_status_response(self, response):
+        tlv_data = parse_tlv(response)
+        for tag, length, value, subitems in tlv_data:
+            if tag == 0xF2: # Card Data
+                continue # Ignore for now
+
+            aid = ''.join(f'{b:02X}' for b in value[:length-1])
+            state_byte = value[-1]
+
+            state = "Unknown"
+            if state_byte == 0x01:
+                state = "Installed"
+            elif state_byte == 0x03:
+                state = "Selectable"
+            elif state_byte == 0x07:
+                state = "Locked"
+
+            self.applet_tree.insert("", "end", values=(aid, state))
+
+    def setup_sim_tab(self):
+        sim_frame = ttk.Frame(self.notebook)
+        self.notebook.add(sim_frame, text="SIM Card")
+
+        # SIM controls
+        control_group = ttk.LabelFrame(sim_frame, text="SIM Operations", padding=10)
+        control_group.pack(fill="x", padx=10, pady=5)
+
+        ttk.Button(control_group, text="Read Basic Info", command=self.read_sim_basic_info).pack(side="left", padx=5)
+        ttk.Button(control_group, text="Read SMS", command=self.read_sim_sms).pack(side="left", padx=5)
+
+        # Info display
+        info_group = ttk.LabelFrame(sim_frame, text="SIM Information", padding=10)
+        info_group.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.sim_info_text = tk.Text(info_group, height=15, font=("Courier", 9), bg="#f8f9fa", wrap=tk.WORD)
+        self.sim_info_text.pack(fill="both", expand=True)
+
+    def read_sim_basic_info(self):
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
+        self.sim_info_text.delete(1.0, tk.END)
+
+        try:
+            # Select MF
+            self.send_apdu_internal([0x00, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00], "Select MF")
+
+            # Select DF Telecom
+            self.send_apdu_internal([0x00, 0xA4, 0x00, 0x00, 0x02, 0x7F, 0x10], "Select DF Telecom")
+
+            # Read EF_ICCID
+            self.read_sim_ef("EF_ICCID", [0x00, 0xB0, 0x00, 0x00, 10])
+
+            # Read EF_IMSI
+            self.read_sim_ef("EF_IMSI", [0x00, 0xB0, 0x00, 0x00, 9])
+
+        except Exception as e:
+            self.sim_info_text.insert(tk.END, f"Error reading SIM info: {e}\n")
+
+    def read_sim_ef(self, name, apdu):
+        try:
+            response, sw1, sw2 = self.reader.transmit(apdu)
+            if sw1 == 0x90 and sw2 == 0x00:
+                self.sim_info_text.insert(tk.END, f"{name}: {''.join(f'{b:02X}' for b in response)}\n")
+            else:
+                self.sim_info_text.insert(tk.END, f"Could not read {name} (SW: {sw1:02X}{sw2:02X})\n")
+        except Exception as e:
+            self.sim_info_text.insert(tk.END, f"Error reading {name}: {e}\n")
+
+    def read_sim_sms(self):
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
+        self.sim_info_text.delete(1.0, tk.END)
+        self.sim_info_text.insert(tk.END, "Reading SMS...\n")
+
+        try:
+            # Select EF_SMS
+            self.send_apdu_internal([0x00, 0xA4, 0x00, 0x00, 0x02, 0x6F, 0x3C], "Select EF_SMS")
+
+            # Read SMS records
+            for i in range(1, 21): # Try to read first 20 SMS
+                apdu = [0x00, 0xB2, i, 0x04, 0xB0] # Read record i
+                response, sw1, sw2 = self.reader.transmit(apdu)
+                if sw1 == 0x90 and sw2 == 0x00:
+                    self.sim_info_text.insert(tk.END, f"\nSMS Record {i}:\n")
+                    self.parse_sms_record(response)
+                else:
+                    # Stop if record not found
+                    break
+        except Exception as e:
+            self.sim_info_text.insert(tk.END, f"Error reading SMS: {e}\n")
+
+    def parse_sms_record(self, record_data):
+        # This is a simplified parser for SMS-DELIVER messages
+        try:
+            status = record_data[0]
+            sender_len = record_data[2]
+            sender = record_data[9:9 + (sender_len+1)//2]
+            timestamp = record_data[9 + (sender_len+1)//2 : 16 + (sender_len+1)//2]
+            msg_len = record_data[-1]
+            msg = record_data[-(msg_len):]
+
+            self.sim_info_text.insert(tk.END, f"  Status: {'Read' if status == 1 else 'Unread'}\n")
+            self.sim_info_text.insert(tk.END, f"  Sender: {''.join(f'{b:02X}' for b in sender)}\n")
+            self.sim_info_text.insert(tk.END, f"  Message: {msg.decode('latin-1', errors='ignore')}\n")
+        except Exception as e:
+            self.sim_info_text.insert(tk.END, f"  Error parsing SMS record: {e}\n")
+
+    def setup_crypto_tab(self):
+        crypto_frame = ttk.Frame(self.notebook)
+        self.notebook.add(crypto_frame, text="Crypto Wallet")
+
+        # Crypto controls
+        control_group = ttk.LabelFrame(crypto_frame, text="Crypto Operations", padding=10)
+        control_group.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(control_group, text="Derivation Path (BIP32):").grid(row=0, column=0, sticky="w", pady=2)
+        self.derivation_path_entry = ttk.Entry(control_group, width=30)
+        self.derivation_path_entry.grid(row=0, column=1, padx=10, sticky="w")
+        self.derivation_path_entry.insert(0, "44'/0'/0'/0/0")
+
+        ttk.Button(control_group, text="Get BTC Address", command=self.get_btc_address).grid(row=0, column=2, padx=5)
+
+        # Info display
+        info_group = ttk.LabelFrame(crypto_frame, text="Wallet Information", padding=10)
+        info_group.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.crypto_info_text = tk.Text(info_group, height=10, font=("Courier", 10), bg="#f8f9fa", wrap=tk.WORD)
+        self.crypto_info_text.pack(fill="both", expand=True)
+
+    def get_btc_address(self):
+        if not self.is_connected:
+            messagebox.showwarning("Warning", "Please connect to a reader first")
+            return
+
+        self.crypto_info_text.delete(1.0, tk.END)
+
+        try:
+            # Select Bitcoin Applet
+            btc_aid = bytes.fromhex("A000000003000000") # Placeholder, should be specific
+            self.send_apdu_internal([0x00, 0xA4, 0x04, 0x00, len(btc_aid)] + list(btc_aid), "Select BTC Applet")
+
+            # Get public key
+            path = self.derivation_path_entry.get()
+            self.get_wallet_public_key(path)
+
+        except Exception as e:
+            self.crypto_info_text.insert(tk.END, f"Error: {e}\n")
+
+    def get_wallet_public_key(self, path):
+        # This is a simplified version of the GET WALLET PUBLIC KEY command
+        # A real implementation would need to properly encode the derivation path
+
+        # For now, we will use a dummy command and response for demonstration
+        dummy_apdu = [0xE0, 0x40, 0x00, 0x00, 0x00]
+        self.log_to_console("Sending dummy GET WALLET PUBLIC KEY command...")
+
+        # Dummy response (uncompressed public key)
+        dummy_response = bytes.fromhex(
+            "04"  # Uncompressed key prefix
+            "88F355359C793836173748B833219525412437344078426029B3775986B2F1F8"
+            "4CE0048B34725D34C03B64344558F4994273E18820B925327667683A41E67114"
+        )
+
+        self.parse_public_key_response(dummy_response)
+
+    def parse_public_key_response(self, response):
+        import ecdsa
+        import hashlib
+        import base58
+
+        # Extract public key from response
+        public_key = response
+
+        # 1. Uncompressed public key to compressed
+        if public_key[0] == 0x04:
+            x = public_key[1:33]
+            y = public_key[33:65]
+            prefix = b'\x02' if y[-1] % 2 == 0 else b'\x03'
+            compressed_key = prefix + x
+        else:
+            compressed_key = public_key
+
+        # 2. SHA-256 hash of the compressed key
+        sha256_hash = hashlib.sha256(compressed_key).digest()
+
+        # 3. RIPEMD-160 hash of the SHA-256 hash
+        ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
+
+        # 4. Add version byte (0x00 for mainnet)
+        versioned_hash = b'\x00' + ripemd160_hash
+
+        # 5. Double SHA-256 hash for checksum
+        checksum = hashlib.sha256(hashlib.sha256(versioned_hash).digest()).digest()[:4]
+
+        # 6. Append checksum
+        binary_address = versioned_hash + checksum
+
+        # 7. Base58 encode
+        btc_address = base58.b58encode(binary_address).decode('utf-8')
+
+        self.crypto_info_text.insert(tk.END, f"Public Key (compressed): {''.join(f'{b:02X}' for b in compressed_key)}\n")
+        self.crypto_info_text.insert(tk.END, f"Bitcoin Address: {btc_address}\n")
+
 
     def clone_card(self):
         self.log_to_console("Card cloning feature requires special authorization...")
